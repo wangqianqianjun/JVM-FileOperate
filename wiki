@@ -1,0 +1,86 @@
+背景
+	100个用户同时提交文件对服务器而言相当是100个长连接，而且在系统设计层面我们需要对文件计算MD5值来防止文件重复提交，因此需要对文件进行读和写的双重操作。所以现在的场景就是服务器需要处理100个长连接，并且需要对100个20M文件进行读操作计算MD5，然后写入硬盘。这是一个挑战。
+解决方案
+	在代码优化和JVM调优之前我们对原有的上传文件功能进行压测。
+	硬件配置如下：
+	服务器
+CPU：E5-2620V4 8核2.1GHz
+内存：16G
+网卡：千兆网卡
+	客户端
+CPU：Intel i5及以上
+内存：8G
+	我们使用jmeter对其进行压测。压测后jmeter反应平均响应时间在400秒左右。然后在维持原始环境的情况下进行第二次压测，这次JVM直接抛出了异常，java.lang.OutOfMemoryError: Java heap space。
+	问题需要一步一步解决。
+	首先响应速度在400秒这是肯定不能接受的。
+	我们需要在代码层面进行优化。由于我们的服务是支持文件分片上传的。所以每上传一个文件都需要去数据库里面查询这个文件是否存在，如果存在那么对这个文件进行追加写入，然后重新计算MD5。
+	经过分析，我们在文件写处理上采用了RandomAccessFile，因为随机文件写可以直接定位到文件末尾，然后进行文件写入，这样就不用将原始文件读入JVM内存了。这是很有意义的，假想下，假如我们要对一个10G文件进行追加写操作，我们的JVM内存只有1G，那么在使用FileOutputStreamn(filePath,ture)这种方式的话，肯定会出现内存溢出的。
+使用RandomAccessFile写操作如下：
+RandomAccessFile raf=new RandomAccessFile(filePath, "rw");
+//将raf位置置到末尾,进行文件追加
+raf.seek(raf.length());
+byte [] b=StreamUtils.input2byte(in);
+raf.write(b);
+在获取文件之后，直接定位到文件末尾。然后将inputStream转换成一个byte数组进行文件写入。
+更新完服务后我们又进行了一轮压力测试。这次平均响应时间在120秒左右，等第一组处理完毕进行第二组压力测试。又抛出了内存溢出的异常。不过这次和上次好像有点不一样。java.lang.OutOfMemoryError: PermGen space 。
+这次抛出的是老年代内存溢出。
+再次对代码进行分析。
+我们发现关键节点可能出在这里。
+byte [] b=StreamUtils.input2byte(in);
+	这里的处理逻辑是将一个文件输入流转换成一个byte[]数组，在单元测试的时候我曾经对比过让RandomAccessFile直接写入一个数组和轮询写入数组，直接写入一个大数组的效率比较高。在100个20m文件分别写入整个byte[]数组和轮询写入byte的性能差别如下:
+实验数据一共五组，单位毫秒。
+byte[]  45895 59187 60639 138489 59927
+轮询    74679 74703 74332 74221  74122
+	可以看出直接写入完整的byte[]数组性能较高，除却一次我机器卡顿异常导致的数值偏大之外，正常情况下都比轮询写入要快60%左右。
+	但是我忽略了单元测试的条件下，一次测试完毕内存就会被回收。而在实际场景，一个inputStream流是20M左右，直接转换成一个byte[]数组,对象太大会直接进入老年代。我们觉得可能这是老年代内存溢出的关键。于是将代码进行调整。调整为
+try ( RandomAccessFile raf=new RandomAccessFile(filePath, "rw");
+      InputStream in = multipartFile.getInputStream()
+      ){
+    //将raf位置置到末尾,进行文件追加
+    raf.seek(raf.length());
+    byte[] buff = new byte[1024];
+    int rc;
+    while ((rc = in.read(buff, 0, 100)) > 0) {
+        raf.write(buff, 0, rc);
+    }
+}catch (Exception e){
+    logger.error("操作文件异常 : {}",e.getMessage());
+    return null;
+}
+	调整完代码之后进行文件上传压力测试，100次提交平均响应在130秒左右，接着进行第二次压力测试，在140秒上线浮动。内存溢出的问题被彻底解决。
+	接着再对代码进行分析，因为再写入文件完成之后，还需要对文件进行一次MD5运算。经过测试，决定采用java nio的channel进行读运算。于是计算MD5模块就变成这样：
+//非常重要,将raf位置置回初始位置,才能正确读取md5
+raf.seek(0);
+channel = raf.getChannel();
+checkCode = MD5.fileChannelMd5(channel);
+	对项目进行打包，重新部署，然后进行压测。第一次压测后，平均响应在90秒左右浮动，第二次压测性能反而有所提升，达到60秒左右。
+	从最初的400秒抛异常到现在60秒，表面上已经有了很大的提升，但是离性能指标25秒还有很大的距离。
+	这时候我们对JVM进行分析，我们使用jconsole对jvm状态进行监控。发现
+GC比较频繁，这时候查看了参数。
+ 
+	发现年轻代使用的是Parallel Scavenge，老年代使用的是Parallel Old。这是tomcat默认的垃圾收集器。而且tomcat默认堆内存也较小。
+	所以接下来我们决定从JVM参数优化上着手。
+	首先将JVM参数进行设置：
+	set JAVA_OPTS=-server -XX:PermSize=512m -XX:MaxPermSize=1024m -Xms2048m -Xmx4096m -XX:+UnlockExperimentalVMOptions -verbose:gc -XX:+UseG1GC -XX:InitiatingHeapOccupancyPercent=70 -XX:+PrintGCDetails -XX:+PrintGCTimeStamps -XX:+PrintGCDateStamps -Xloggc:C:\gc.log -XX:+PrintHeapAtGC -XX:+PrintTenuringDistribution -XX:+PrintGCApplicationStoppedTime -XX:+PrintGCApplicationConcurrentTime
+	附上各参数含义：
+-Xms：Java虚拟机初始化时堆的最小内存，一般与 Xmx配置为相同值，这样的好处是GC不必再为扩展内存空间而消耗性能；
+-Xmx：Java虚拟机可使用堆的最大内存；
+-XX:PermSize：Java虚拟机永久代大小；
+-XX:MaxPermSize：Java虚拟机永久代大小最大值；
+	-XX:+UnlockExperimentalVMOptions：解锁JVM虚拟机性能，具体请查阅oracle官方文档；
+	-verbose:gc: 表示输出虚拟机中GC的详细情况；
+	-XX:+UseG1GC：使用G1垃圾回收器；
+	-XX:InitiatingHeapOccupancyPercent=70：设置老年代内存占用多少时发生GC，这里设置为70%；
+	-Xloggc:C:\gc.log：存储GC日志。
+	其余参数对虚拟机性能没有太大影响，请自行查阅。
+	调整完了之后，我们再进行压测，性能有了很明显提升，第一压测时平均处理时间在25秒左右浮动。等虚拟机预热后接着进行压测，发现响应提升到了17秒左右，具体附上jmeter的截图。
+	 
+	这是100个测试脚本。
+	 
+	这是响应。
+	经过多次压测后分析图形报告，我们发现平均值往7秒在稳定。
+	 
+	我们又使用另外一种jvm监控工具，jvisualvm对虚拟机进行监控。
+	 
+	可以看出每次压力测试都会出现几个峰值。堆大小比较稳定。几次回落是我手动GC导致，内存没有明显上升。
+	对堆dump进行分析。
